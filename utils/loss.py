@@ -2,11 +2,14 @@
 """
 Loss functions
 """
+import pickle
+import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from utils.metrics import bbox_iou
+from utils.metrics import bbox_iou, iou_thresholded
 from utils.torch_utils import de_parallel
 
 
@@ -118,11 +121,76 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-    def __call__(self, p, targets):  # predictions, targets
+    def our_loss(self, p, targets):
+        # targets: N x 6, [img, class, x, y, w, h], where N - number of targets for whole batch
+        # p: [num_layers, batch_size, anchors, gridy, gridx, (pxy, pwh, _, pcl)]
+
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
+        correct_preds = [0] * len(thresholds)
+        loss_xy, loss_wh, loss_cls, loss_obj, preds = 0.0, 0.0, 0.0, 0.0, 0.0
+        for i, pi in enumerate(p):  # layer index, layer predictions
+
+            b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
+            txy = tbox[i][:, 0:2].cpu().detach()
+            twh = tbox[i][:, 2:4].cpu().detach()
+            n = b.shape[0]  # number of targets
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+
+            if n:
+                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+
+                # Regression https://github.com/ultralytics/yolov5/issues/471
+                pxy = (pxy.sigmoid() * 2 - 0.5).cpu().detach()
+                pwh = ((pwh.sigmoid() * 2) ** 2 * anchors[i]).cpu().detach()
+                pbox = torch.cat((pxy, pwh), 1)
+
+                loss_xy += (((pxy[:, 0] - txy[:, 0]) ** 2) +
+                            ((pxy[:, 1] - txy[:, 1]) ** 2)).mean().cpu().item()
+                loss_wh += (((np.sqrt(pwh[:, 0]) - np.sqrt(twh[:, 0])) ** 2) +
+                            ((np.sqrt(pwh[:, 1]) - np.sqrt(twh[:, 1])) ** 2)).mean().cpu().item()
+
+                # Classification
+                if self.nc > 1:  # cls loss (only if multiple classes)
+                    t = torch.full_like(pcls, self.cn, device=self.device)  # targets
+                    t[range(n), tcls[i]] = self.cp
+                    loss_cls += np.sum(((pcls.sigmoid().cpu() - t.cpu()) ** 2).detach().numpy(), axis=1).mean()
+
+                # Objectiveness
+                iou = bbox_iou(pbox.cuda(), tbox[i]).squeeze().detach().clamp(0).type(tobj.dtype)
+                tobj[b, a, gj, gi] = iou
+                # pi[...,4] is confidence that there is an object
+                # tobj is iou between each predicted and target box
+                loss_obj += np.sum(((tobj.cpu() - pi[..., 4].sigmoid().cpu()) ** 2).detach().numpy(), axis=1).mean()
+
+                # Accuracy
+                predicted_class = torch.argmax(pcls, dim=1)
+                correct_class = tcls[i]
+                for idx, threshold in enumerate(thresholds):
+                    objectiveness = iou_thresholded(pbox.cuda(), tbox[i], threshold=threshold).squeeze() \
+                        .detach().type(tobj.dtype)
+                    correct_preds[idx] += torch.sum((predicted_class == correct_class) * objectiveness).cpu().item()
+                preds += predicted_class.size()[0]
+
+        with open('loss_xy.txt', 'a') as f:
+            f.write(str(loss_xy) + '\n')
+        with open('loss_wh.txt', 'a') as f:
+            f.write(str(loss_wh) + '\n')
+        with open('loss_cls.txt', 'a') as f:
+            f.write(str(loss_cls) + '\n')
+        with open('loss_obj.txt', 'a') as f:
+            f.write(str(loss_obj) + '\n')
+        with open('acc.txt', 'a') as f:
+            f.write(" ".join([str(correct / preds) for correct in correct_preds]) + '\n')
+
+    def __call__(self, p, targets, train=False):  # predictions, targets
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+
+        if train:
+            self.our_loss(p, targets)
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
